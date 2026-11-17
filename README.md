@@ -1,7 +1,26 @@
-# AgriVision-AI 🌾🤖
+# Pattern-Recognition
+# Dự án: AgriVision-AI 🌾🤖
 
 > **Intelligent Agricultural Image Classification & Decision Support Platform**  
 > *Nền tảng Thị giác Máy tính Thông minh trong Phân loại và Giám sát Nông nghiệp*
+
+Saigon University, Ho Chi Minh City, Vietnam<br/>
+**2026 Phân tích và nhận dạng mẫu**<br/>
+**Instructor:** Nguyễn Thanh Phước
+
+### Team Members
+
+| No. | Full Name | Student ID |
+|:---:|-----------|:----------:|
+| 1 | Ngô Đông Ất | 3123410014 |
+| 2 | Nguyễn Đăng Khoa | 3123410169 |
+| 3 | Lê Thanh Phát | 3123410258 |
+
+**Target:** Xây dựng nền tảng thị giác máy tính thông minh phân loại hình ảnh nông nghiệp, kết hợp nghiên cứu mô hình học sâu (Deep Learning) và triển khai ứng dụng thực tế.
+
+## Personal information
+**Nguyễn Thanh Phước**<br/>
+**Saigon University, Vietnam**<br/>
 
 ---
 
@@ -30,11 +49,8 @@ AgriVision-AI/
 │   └── requirements.txt
 │
 ├── project3_model/      # [AI Core] Pipeline nghiên cứu & huấn luyện Deep Learning
-│   ├── AI-for-Agriculture-2026/  # Pipeline PyTorch, late-fusion, experiment tracking
-│   ├── Log thực nghiệm/          # Bảng theo dõi và đánh giá metrics
-│   └── ảnh confusion matrix/     # Trực quan hóa kết quả đánh giá (Evaluation)
+│   └── AI-for-Agriculture-2026/  # Pipeline PyTorch, late-fusion, experiment tracking
 │
-├── img/                 # Tài nguyên hình ảnh, branding & logo
 └── README.md            # Tài liệu tổng quan sản phẩm
 ```
 
