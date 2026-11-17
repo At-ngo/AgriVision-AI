@@ -1,0 +1,121 @@
+# ==============================================================================
+# AgriVision-AI .gitignore
+# ==============================================================================
+
+# User / Documentation (thư mục docs đã thêm trước đó)
+docs/
+
+# --- Python & Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments (Môi trường ảo) ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Environment Variables & Secrets (Bảo mật / Cấu hình bí mật) ---
+.env
+.env.local
+.env.*.local
+*.env
+*.secret
+
+# --- AI / Deep Learning Models & Weights (Trọng số & Mô hình huấn luyện) ---
+checkpoints/
+**/checkpoints/
+*.pt
+*.pth
+*.pt1
+*.onnx
+*.h5
+*.ckpt
+*.safetensors
+*.bin
+
+# --- Datasets & Data Splits (Dữ liệu huấn luyện & ảnh thô dung lượng lớn) ---
+data/
+dataset/
+datasets/
+data_split/
+raw_data/
+*.tif
+*.tiff
+
+# --- Experiment Tracking & Logs (Theo dõi thực nghiệm & Nhật ký log) ---
+wandb/
+**/wandb/
+runs/
+mlruns/
+lightning_logs/
+*.log
+logs/
+project3_model/Log thực nghiệm/
+project3_model/submission/
+project3_model/ảnh confusion matrix/
+project3_model/AI-for-Agriculture-2026/outputs/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# --- Testing & Code Quality ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Streamlit Cache ---
+.streamlit/
+
+# --- IDEs & Code Editors ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# --- Hệ điều hành (Windows / macOS) ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- LaTeX temporary files (khi biên dịch báo cáo LaTeX) ---
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
