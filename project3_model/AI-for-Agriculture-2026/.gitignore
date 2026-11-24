@@ -4,13 +4,14 @@ data/
 dataset/
 data_split/
 
-# Model Checkpoints (NEVER push heavy weights)
-checkpoints/
+# Model Checkpoints (NEVER push heavy weights, except lightweight hybrid_ensemble_v6.joblib for web deployment)
+checkpoints/*
 *.pt
 *.pth
 *.pt1
 *.ckpt
 *.joblib
+!checkpoints/hybrid_ensemble_v6.joblib
 
 # WandB & Logs
 wandb/
