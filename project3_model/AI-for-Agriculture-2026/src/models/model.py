@@ -363,25 +363,441 @@ class MultimodalClassifier(nn.Module):
         print("[MultimodalClassifier] All parameters unfrozen.")
 
 
+# ──────────────────────────────────────────────
+# Spectral Attention: SE Block chọn lọc bước sóng
+# ──────────────────────────────────────────────
+class SpectralAttention(nn.Module):
+    """Squeeze-and-Excitation trên chiều kênh phổ (125 kênh HS)."""
+    def __init__(self, channels: int = 125, reduction: int = 8):
+        super().__init__()
+        reduced = max(8, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, reduced, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        w = self.fc(x).view(b, c, 1, 1)
+        return x * w
+
+
+class CompactHSBranch(nn.Module):
+    """Nhánh trích xuất đặc trưng Siêu phổ nhỏ gọn kèm Spectral Attention (ra 128-d)."""
+    def __init__(self, in_channels: int = 125, out_features: int = 128, dropout_p: float = 0.3):
+        super().__init__()
+        self.attention = SpectralAttention(channels=in_channels, reduction=8)
+        self.net = nn.Sequential(
+            # Giảm chiều kênh phổ từ 125 xuống 64
+            nn.Conv2d(in_channels, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # Trích xuất đặc trưng không gian
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 32x32 -> 16x16
+            
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(128, out_features),
+            nn.LayerNorm(out_features),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_att = self.attention(x)
+        return self.head(self.net(x_att))
+
+
+class CompactMSBranch(nn.Module):
+    """Nhánh trích xuất đặc trưng Đa phổ nhỏ gọn (ra 128-d)."""
+    def __init__(self, in_channels: int = 5, out_features: int = 128, dropout_p: float = 0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 64x64 -> 32x32
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 32x32 -> 16x16
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=dropout_p),
+            nn.Linear(128, out_features),
+            nn.LayerNorm(out_features),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.net(x))
+
+
+class SpectralGatedFusionClassifier(nn.Module):
+    """
+    SG-CFNet: Spectral-Gated Compact Fusion Network.
+    - Cân bằng chiều đặc trưng (mỗi nhánh 128 chiều).
+    - Chuẩn hóa L2-Norm để các nhánh không lấn át lẫn nhau.
+    - Cổng Gated Multimodal Attention học trọng số động (alpha_rgb, alpha_ms, alpha_hs).
+    - Modality Dropout (15% cơ hội tắt bớt một kênh trong training).
+    """
+    def __init__(
+        self,
+        num_classes: int = 3,
+        rgb_model: str = "resnet18",
+        rgb_pretrained: bool = True,
+        branch_dim: int = 128,
+        dropout_p: float = 0.3,
+        modality_dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.branch_dim = branch_dim
+        self.modality_dropout = modality_dropout
+
+        # 1. Nhánh RGB Pretrained
+        spec = get_rgb_backbone_spec(rgb_model)
+        _resnet = spec.model_fn(weights=spec.weights if rgb_pretrained else None)
+        self.rgb_branch = nn.Sequential(*list(_resnet.children())[:-1])
+        self.rgb_proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout_p),
+            nn.Linear(spec.out_features, branch_dim),
+            nn.LayerNorm(branch_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # 2. Nhánh MS & HS
+        self.ms_branch = CompactMSBranch(in_channels=5, out_features=branch_dim, dropout_p=dropout_p)
+        self.hs_branch = CompactHSBranch(in_channels=125, out_features=branch_dim, dropout_p=dropout_p)
+
+        # 3. Cổng Gated Attention (tính alpha cho 3 modality)
+        self.gate_fc = nn.Sequential(
+            nn.Linear(branch_dim * 3, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 3),
+            nn.Softmax(dim=1),
+        )
+
+        # 4. Classification Head
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_p),
+            nn.Linear(branch_dim * 2, branch_dim),
+            nn.LayerNorm(branch_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_p),
+            nn.Linear(branch_dim, num_classes),
+        )
+
+    def forward(self, hs: torch.Tensor, ms: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
+        f_rgb = self.rgb_proj(self.rgb_branch(rgb))
+        f_ms  = self.ms_branch(ms)
+        f_hs  = self.hs_branch(hs)
+
+        # Chuẩn hóa L2-Normalization
+        f_rgb_norm = nn.functional.normalize(f_rgb, p=2, dim=1)
+        f_ms_norm  = nn.functional.normalize(f_ms,  p=2, dim=1)
+        f_hs_norm  = nn.functional.normalize(f_hs,  p=2, dim=1)
+
+        # Modality dropout trong lúc train
+        if self.training and self.modality_dropout > 0:
+            mask = torch.rand(f_rgb.size(0), 2, device=f_rgb.device) > self.modality_dropout
+            f_ms_norm = f_ms_norm * mask[:, 0:1]
+            f_hs_norm = f_hs_norm * mask[:, 1:2]
+
+        # Ghép đặc trưng và tính cổng Gated weights (B, 3)
+        concat_all = torch.cat([f_rgb_norm, f_ms_norm, f_hs_norm], dim=1)
+        gates = self.gate_fc(concat_all)
+
+        # Gated Weighted Sum kết hợp với Concatenated Gated features
+        gated_fused = (
+            gates[:, 0:1] * f_rgb_norm +
+            gates[:, 1:2] * f_ms_norm +
+            gates[:, 2:3] * f_hs_norm
+        )
+        
+        # Kết hợp thông tin tổng hợp và trọng số RGB
+        combined = torch.cat([gated_fused, f_rgb_norm], dim=1)
+        return self.classifier(combined)
+
+    def freeze_rgb_branch(self):
+        """Đóng băng nhánh RGB để khởi động và huấn luyện trước hai nhánh phổ HS & MS."""
+        for param in self.rgb_branch.parameters():
+            param.requires_grad = False
+        print("[SG-CFNet] RGB branch frozen for warm-up.")
+
+    def unfreeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = True
+        print("[SG-CFNet] All parameters unfrozen for joint fine-tuning.")
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def summary(self):
+        total = self.count_parameters()
+        rgb_p  = sum(p.numel() for p in self.rgb_branch.parameters()) + sum(p.numel() for p in self.rgb_proj.parameters())
+        ms_p   = sum(p.numel() for p in self.ms_branch.parameters())
+        hs_p   = sum(p.numel() for p in self.hs_branch.parameters())
+        gate_p = sum(p.numel() for p in self.gate_fc.parameters())
+        head_p = sum(p.numel() for p in self.classifier.parameters())
+        print("[SpectralGatedFusionClassifier (SG-CFNet)]")
+        print(f"  num_classes   : {self.num_classes}")
+        print(f"  total params  : {total:,}")
+        print(f"    rgb_branch  : {rgb_p:,}")
+        print(f"    ms_branch   : {ms_p:,}")
+        print(f"    hs_branch   : {hs_p:,}")
+        print(f"    gate_fc     : {gate_p:,}")
+        print(f"    classifier  : {head_p:,}")
+        print(f"  device        : {next(self.parameters()).device}")
+
+
+# ──────────────────────────────────────────────
+# SS-CFNet v5: Spectral-Spatial Compact Fusion Network
+# ──────────────────────────────────────────────
+class PixelSNV(nn.Module):
+    """
+    Standard Normal Variate (SNV) theo từng pixel dọc theo chiều kênh phổ (dim=1).
+    Khử hoàn toàn biến thiên chiếu sáng, bóng đổ do độ cong của lá và viền đen.
+    """
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=1, keepdim=True)
+        std = x.std(dim=1, keepdim=True)
+        valid_mask = (std > 1e-4).float()
+        return (x - mean) / (std + self.eps) * valid_mask
+
+
+class AdvancedHSBranch(nn.Module):
+    """
+    Nhánh Siêu phổ nâng cao:
+    1. Per-pixel SNV: chuẩn hóa phổ triệt tiêu bóng đổ / chiếu sáng.
+    2. Đạo hàm phổ bậc 1 (Spectral Derivative): nắm bắt độ dốc Red-Edge (bước nhảy 690-740nm).
+    3. Ghép nối 125 kênh SNV + 124 kênh Derivative = 249 kênh.
+    4. 1x1 Conv giảm số kênh xuống 64, theo sau bởi 2 khối tích chập không gian.
+    5. Bộ bảo vệ tensor lỗi (zero-tensor guard): tự động bỏ qua nếu ảnh HS rỗng.
+    """
+    def __init__(self, in_channels: int = 125, out_features: int = 128, dropout_p: float = 0.3):
+        super().__init__()
+        self.snv = PixelSNV()
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(in_channels + (in_channels - 1), 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+        self.conv_blocks = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout_p),
+            nn.Linear(128, out_features),
+            nn.LayerNorm(out_features),
+            nn.GELU(),
+        )
+
+    def forward(self, hs: torch.Tensor) -> torch.Tensor:
+        is_sample_valid = (hs.abs().sum(dim=[1, 2, 3], keepdim=True) > 1e-3).float()
+        hs_snv = self.snv(hs)
+        d1 = hs_snv[:, 1:] - hs_snv[:, :-1]
+        cube = torch.cat([hs_snv, d1], dim=1)
+        feat = self.conv1x1(cube)
+        feat = self.conv_blocks(feat)
+        out = self.fc(feat)
+        return out * is_sample_valid.squeeze(-1).squeeze(-1)
+
+
+class AdvancedMSBranch(nn.Module):
+    """
+    Nhánh Đa phổ nâng cao:
+    Tích hợp trực tiếp các chỉ số thực vật hóa sinh:
+    - NDVI: (NIR - Red) / (NIR + Red)
+    - NDRE: (NIR - RedEdge) / (NIR + RedEdge)
+    - GNDVI: (NIR - Green) / (NIR + Green)
+    Ghép 5 kênh phổ gốc + 3 kênh chỉ số = 8 kênh đầu vào.
+    """
+    def __init__(self, in_channels: int = 5, out_features: int = 64, dropout_p: float = 0.3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels + 3, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout_p),
+            nn.Linear(64, out_features),
+            nn.LayerNorm(out_features),
+            nn.GELU(),
+        )
+
+    def forward(self, ms: torch.Tensor) -> torch.Tensor:
+        is_sample_valid = (ms.abs().sum(dim=[1, 2, 3], keepdim=True) > 1e-3).float()
+        eps = 1e-5
+        ndvi = (ms[:, 4:5] - ms[:, 2:3]) / (ms[:, 4:5] + ms[:, 2:3] + eps)
+        ndre = (ms[:, 4:5] - ms[:, 3:4]) / (ms[:, 4:5] + ms[:, 3:4] + eps)
+        gndvi = (ms[:, 4:5] - ms[:, 1:2]) / (ms[:, 4:5] + ms[:, 1:2] + eps)
+
+        ms_aug = torch.cat([ms, ndvi, ndre, gndvi], dim=1)
+        feat = self.conv(ms_aug)
+        out = self.fc(feat)
+        return out * is_sample_valid.squeeze(-1).squeeze(-1)
+
+
+class SSCFNetClassifier(nn.Module):
+    """
+    Spectral-Spatial Compact Fusion Network (SS-CFNet v5).
+    Kiến trúc Residual Multimodal Fusion kết hợp ưu thế:
+    1. RGB Branch (ResNet-18 ImageNet pretrained) giữ nguyên 512 đặc trưng và đưa trực tiếp vào RGB Logits.
+       -> Bảo vệ 82.5% độ nhận diện Health & Other, không bị ép hẹp bottleneck.
+    2. Spectral Branch:
+       - HS Branch (128-d): Pixel-SNV + Spectral Derivative (Red-Edge).
+       - MS Branch (64-d): NDVI, NDRE, GNDVI.
+       -> Spectral Head đưa ra Refinement Logits chuyên biệt để phát hiện Rust ẩn.
+    3. Cổng điều tiết động Adaptive Residual Gate (alpha):
+       alpha = Sigmoid(Linear(RGB + Spectral)) in [0, 1].
+       Logits = Logits_RGB + alpha * Logits_Spectral.
+    """
+    def __init__(
+        self,
+        num_classes: int = 3,
+        rgb_model: str = "resnet18",
+        rgb_pretrained: bool = True,
+        dropout_p: float = 0.3,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # 1. RGB Primary Branch
+        spec = get_rgb_backbone_spec(rgb_model)
+        _resnet = spec.model_fn(weights=spec.weights if rgb_pretrained else None)
+        self.rgb_branch = nn.Sequential(*list(_resnet.children())[:-1])
+        self.rgb_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(dropout_p),
+            nn.Linear(spec.out_features, num_classes),
+        )
+
+        # 2. Spectral Refinement Branches
+        self.hs_branch = AdvancedHSBranch(in_channels=125, out_features=128, dropout_p=dropout_p)
+        self.ms_branch = AdvancedMSBranch(in_channels=5, out_features=64, dropout_p=dropout_p)
+
+        self.spectral_head = nn.Sequential(
+            nn.Linear(128 + 64, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(128, num_classes),
+        )
+
+        # 3. Dynamic Residual Gate
+        self.gate_fc = nn.Sequential(
+            nn.Linear(spec.out_features + 192, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, hs: torch.Tensor, ms: torch.Tensor, rgb: torch.Tensor) -> torch.Tensor:
+        f_rgb = torch.flatten(self.rgb_branch(rgb), 1)
+        logits_rgb = self.rgb_head(f_rgb)
+
+        f_hs = self.hs_branch(hs)
+        f_ms = self.ms_branch(ms)
+        f_spectral = torch.cat([f_hs, f_ms], dim=1)
+        logits_spectral = self.spectral_head(f_spectral)
+
+        alpha = self.gate_fc(torch.cat([f_rgb, f_spectral], dim=1))
+        return logits_rgb + alpha * logits_spectral
+
+    def freeze_rgb_branch(self):
+        for param in self.rgb_branch.parameters():
+            param.requires_grad = False
+        print("[SS-CFNet] RGB branch frozen for warm-up.")
+
+    def unfreeze_all(self):
+        for param in self.parameters():
+            param.requires_grad = True
+        print("[SS-CFNet] All parameters unfrozen for fine-tuning.")
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def summary(self):
+        total = self.count_parameters()
+        rgb_p = sum(p.numel() for p in self.rgb_branch.parameters()) + sum(p.numel() for p in self.rgb_head.parameters())
+        hs_p  = sum(p.numel() for p in self.hs_branch.parameters())
+        ms_p  = sum(p.numel() for p in self.ms_branch.parameters())
+        spec_head_p = sum(p.numel() for p in self.spectral_head.parameters())
+        gate_p = sum(p.numel() for p in self.gate_fc.parameters())
+        print("[SS-CFNet v5 Classifier]")
+        print(f"  num_classes   : {self.num_classes}")
+        print(f"  total params  : {total:,}")
+        print(f"    rgb_branch  : {rgb_p:,}")
+        print(f"    hs_branch   : {hs_p:,}")
+        print(f"    ms_branch   : {ms_p:,}")
+        print(f"    spectral_head: {spec_head_p:,}")
+        print(f"    gate_fc     : {gate_p:,}")
+        print(f"  device        : {next(self.parameters()).device}")
+
+
 def build_multimodal_model(
     cfg:    Any,
     device: torch.device,
-) -> MultimodalClassifier:
+) -> nn.Module:
     """
-    Tạo MultimodalClassifier từ ConfigDict và đưa lên device.
-
-    Các keys dùng trong cfg (có default an toàn):
-        NUM_CLASSES       (bắt buộc)
-        MODEL_NAME        → rgb_model (default 'resnet18')
-        RGB_PRETRAINED    → rgb_pretrained (default True)
-        MS_OUT_FEATURES   → ms_out (default 256)
-        HS_OUT_FEATURES   → hs_out (default 256)
-        DROPOUT_P         → dropout_p (default 0.3)
-        FUSION_HIDDEN     → fusion_hidden (default 512)
-
-    Returns:
-        model đã .to(device)
+    Tạo mô hình Multimodal từ ConfigDict và đưa lên device.
+    Hỗ trợ cả 'ss_cfnet' (v5 Residual), 'spectral_gated' (SG-CFNet v1-4), và 'naive' Late Fusion.
     """
+    fusion_type = getattr(cfg, 'FUSION_TYPE', 'ss_cfnet').lower()
+
+    if fusion_type in {'ss_cfnet', 'sscfnet', 'spectral_spatial', 'residual', 'spectral_gated', 'sg_cfnet', 'gated'}:
+        model = SSCFNetClassifier(
+            num_classes    = cfg.NUM_CLASSES,
+            rgb_model      = getattr(cfg, 'MODEL_NAME', 'resnet18'),
+            rgb_pretrained = getattr(cfg, 'RGB_PRETRAINED', True),
+            dropout_p      = getattr(cfg, 'DROPOUT_P', 0.3),
+        ).to(device)
+        model.summary()
+        return model
+
     model = MultimodalClassifier(
         num_classes    = cfg.NUM_CLASSES,
         rgb_pretrained = getattr(cfg, 'RGB_PRETRAINED',  True),

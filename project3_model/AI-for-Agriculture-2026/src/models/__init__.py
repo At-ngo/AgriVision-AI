@@ -6,6 +6,7 @@ import torchvision.models as tv_models
 from src.models.resnet18_rgb import Resnet18
 from src.models.resnet_34_rgb import Resnet34
 from src.models.efficientnet_b0_rgb import EfficientNetB0
+from src.models.ConvNeXt_Tiny import ConvNeXtTiny
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,15 @@ register_rgb_backbone(
 register_model("resnet18_rgb", Resnet18)
 register_model("resnet34_rgb", Resnet34)
 register_model("efficientnet_b0_rgb", EfficientNetB0)
+register_model("convnext_tiny", ConvNeXtTiny)
+
+# ConvNeXt backbone
+register_rgb_backbone(
+    "convnext_tiny",
+    tv_models.convnext_tiny,
+    tv_models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1,
+    out_features=768,
+)
 
 # EfficientNet backbone.
 register_rgb_backbone(

@@ -46,6 +46,20 @@ def main():
     # Load config from YAMLs
     cfg = load_config(args.configs)
 
+    # Override CLI options if provided
+    if getattr(args, 'device', None):
+        cfg.DEVICE = args.device
+    if getattr(args, 'epochs', None):
+        cfg.EPOCHS = args.epochs
+    if getattr(args, 'batch_size', None):
+        cfg.BATCH_SIZE = args.batch_size
+    if getattr(args, 'lr', None):
+        cfg.LR = args.lr
+    if getattr(args, 'model_name', None):
+        cfg.MODEL_NAME = args.model_name
+    if getattr(args, 'input_mode', None):
+        cfg.INPUT_MODE = args.input_mode
+
     # VAL_RGB_DIR là submission set (không có label) → dùng làm TEST_RGB_DIR.
     # Nếu cần validation nội bộ thì bật VAL_SPLIT > 0 trong train.yaml.
     if not getattr(cfg, 'TEST_RGB_DIR', None):
@@ -92,16 +106,40 @@ def main():
     
     if args.wandb:
         import wandb
+        wandb_mode = getattr(args, 'wandb_mode', 'online')
         
         # Check for WANDB_API_KEY in environment or arguments
         wandb_api_key = os.environ.get("WANDB_API_KEY", args.wandb_api_key)
         if wandb_api_key:
-            wandb.login(key=wandb_api_key)
+            os.environ["WANDB_API_KEY"] = wandb_api_key
             
         base_lr = getattr(cfg, 'LR', getattr(cfg, 'HEAD_LR', 0.0001))
         run_name = args.wandb_run_name if args.wandb_run_name else f"{cfg.MODEL_NAME}_imgsize{cfg.IMG_SIZE}_batch{cfg.BATCH_SIZE}_lr{base_lr}"
-        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=run_name, config=dict(cfg))
-        wandb.config.update(vars(args))
+        
+        # Entity mặc định theo tài khoản của bạn
+        entity = args.wandb_entity if args.wandb_entity else "thanhphat20502-studocu"
+
+        try:
+            run = wandb.init(
+                project=args.wandb_project,
+                entity=entity,
+                name=run_name,
+                mode=wandb_mode,
+                config=dict(cfg)
+            )
+            wandb.config.update(vars(args))
+            print(f"[WandB] Project URL : https://wandb.ai/{entity}/{args.wandb_project}")
+            print(f"[WandB] Run Live    : {run.url if run else '(local)'}")
+        except Exception as e:
+            print(f"[WandB] Lỗi kết nối online ({e}). Tự động chuyển sang chế độ offline.")
+            wandb.init(
+                project=args.wandb_project,
+                entity=entity,
+                name=run_name,
+                mode="offline",
+                config=dict(cfg)
+            )
+            wandb.config.update(vars(args))
     
     # 1. Initialization
     set_seed(cfg.SEED)
@@ -163,11 +201,20 @@ def main():
     elif split_manifest_cfg:
         split_manifest_cfg = os.path.abspath(split_manifest_cfg)
         if not os.path.exists(split_manifest_cfg):
-            raise FileNotFoundError(f"Không tìm thấy SPLIT_MANIFEST_PATH: {split_manifest_cfg}")
-        train_files, val_files, class_to_idx = load_split_manifest(
-            split_manifest_cfg, img_dir=train_rgb
-        )
-        print(f"[Split] Source        : fixed manifest ({split_manifest_cfg})")
+            print(f"[Split] WARNING: Chưa tìm thấy SPLIT_MANIFEST_PATH tại '{split_manifest_cfg}'.")
+            print(f"[Split] Đang tự động tạo split cố định theo VAL_SPLIT={val_split}, SEED={cfg.SEED}...")
+            train_files, val_files, class_to_idx = split_dataset(
+                train_rgb, val_split=val_split, seed=cfg.SEED
+            )
+            manifest_dir = os.path.dirname(split_manifest_cfg)
+            os.makedirs(manifest_dir, exist_ok=True)
+            save_split_audit(manifest_dir, train_files, val_files, class_to_idx)
+            print(f"[Split] Đã lưu manifest mới cố định vào: {split_manifest_cfg}")
+        else:
+            train_files, val_files, class_to_idx = load_split_manifest(
+                split_manifest_cfg, img_dir=train_rgb
+            )
+            print(f"[Split] Source        : fixed manifest ({split_manifest_cfg})")
     else:
         train_files, val_files, class_to_idx = split_dataset(
             train_rgb, val_split=val_split, seed=cfg.SEED
@@ -271,13 +318,22 @@ def main():
 
     unfreeze_epoch = getattr(cfg, 'UNFREEZE_EPOCH', 0)
     if unfreeze_epoch > 1:
-        if hasattr(model, 'freeze_backbone'):
+        if hasattr(model, 'freeze_rgb_branch'):
+            model.freeze_rgb_branch()
+        elif hasattr(model, 'freeze_backbone'):
             model.freeze_backbone()
         else:
             print("[WARN] Model does not have freeze_backbone method. Cannot perform two-stage fine-tuning.")
 
     # 4. Training Setup
-    criterion = nn.CrossEntropyLoss()
+    label_smoothing = getattr(cfg, 'LABEL_SMOOTHING', 0.0)
+    class_weights = getattr(cfg, 'CLASS_WEIGHTS', None)
+    if class_weights is not None:
+        loss_weight = torch.tensor(class_weights, dtype=torch.float, device=device)
+        print(f"[Loss] Áp dụng Class Weights: {class_weights}")
+    else:
+        loss_weight = None
+    criterion = nn.CrossEntropyLoss(weight=loss_weight, label_smoothing=label_smoothing)
     
     # Optimizer configuration
     opt_name = getattr(cfg, 'OPTIMIZER', 'Adam').lower()
@@ -287,18 +343,19 @@ def main():
     backbone_lr = getattr(cfg, 'BACKBONE_LR', None)
     head_lr = getattr(cfg, 'HEAD_LR', base_lr)
     
-    if backbone_lr is not None and hasattr(model, 'backbone'):
+    if backbone_lr is not None and (hasattr(model, 'backbone') or hasattr(model, 'rgb_branch')):
         head_params = []
         backbone_params = []
         for name, param in model.named_parameters():
-            if 'fc' in name or 'head' in name:
-                head_params.append(param)
-            else:
+            if ('backbone' in name and 'fc' not in name) or 'rgb_branch' in name:
                 backbone_params.append(param)
+            else:
+                head_params.append(param)
         param_groups = [
             {'params': backbone_params, 'lr': backbone_lr},
             {'params': head_params, 'lr': head_lr}
         ]
+        print(f"[Optimizer] Parameter Groups: Backbone LR={backbone_lr}, Head/Spectral LR={head_lr}")
     else:
         param_groups = model.parameters()
 
@@ -330,6 +387,7 @@ def main():
 
     mode_prefix = "multimodal" if is_multimodal else "rgb"
     save_name = f"{mode_prefix}_{cfg.MODEL_NAME}_imgsize{cfg.IMG_SIZE}_batch{cfg.BATCH_SIZE}_epoch{cfg.EPOCHS}_lr{base_lr}.pth"
+    os.makedirs(getattr(cfg, 'CHECKPOINT_DIR', 'checkpoints'), exist_ok=True)
     save_path = os.path.join(cfg.CHECKPOINT_DIR, save_name)
     
     # 5. Training
@@ -461,6 +519,13 @@ def main():
             wandb.log({"conf_mat" : wandb.plot.confusion_matrix(probs=None,
                             y_true=y_true, preds=y_pred,
                             class_names=class_names)})
+            
+        cm_png = eval_artifact_paths.get("confusion_png")
+        if cm_png and os.path.exists(cm_png):
+            wandb.log({
+                "val/confusion_matrix_image": wandb.Image(cm_png, caption="Final Validation Confusion Matrix Heatmap"),
+                "confusion_matrix_heatmap": wandb.Image(cm_png, caption="Validation Confusion Matrix")
+            })
 
         # Save output files as artifact for easy retrieval.
         if os.path.exists(output_dir):
@@ -481,17 +546,35 @@ def main():
                 split_artifact.add_file(path)
         wandb.log_artifact(split_artifact)
         
-        # Save best model checkpoint to wandb
-        best_model_artifact = wandb.Artifact('best-model', type='model')
-        best_model_artifact.add_file(save_path)
-        wandb.log_artifact(best_model_artifact)
-        
-        # Save last model checkpoint to wandb
-        last_save_path = save_path.replace('.pth', '_last.pth')
-        if os.path.exists(last_save_path):
-            last_model_artifact = wandb.Artifact('latest-model', type='model')
-            last_model_artifact.add_file(last_save_path)
-            wandb.log_artifact(last_model_artifact)
+        # Save best and last model checkpoint to wandb ("nhớ là lưu checkpoint trên wandb")
+        upload_model = True
+        if upload_model:
+            print(f"[WandB] Đang đồng bộ checkpoint lên WandB Artifacts & Files...")
+            best_model_artifact = wandb.Artifact('best-model', type='model')
+            best_model_artifact.add_file(save_path)
+            wandb.log_artifact(best_model_artifact)
+            try:
+                # On Windows, wandb.save() tries to symlink which fails with WinError 1314 unless Admin.
+                # Copying directly into wandb.run.dir uploads cleanly to the Files tab.
+                if wandb.run and hasattr(wandb.run, 'dir') and wandb.run.dir:
+                    dest_file = os.path.join(wandb.run.dir, os.path.basename(save_path))
+                    shutil.copy2(save_path, dest_file)
+            except Exception as e:
+                print(f"[WandB] Warning copy to run.dir: {e}")
+            print(f"[WandB]  ✓ Đã upload best-model: {save_path}")
+            
+            last_save_path = save_path.replace('.pth', '_last.pth')
+            if os.path.exists(last_save_path):
+                last_model_artifact = wandb.Artifact('latest-model', type='model')
+                last_model_artifact.add_file(last_save_path)
+                wandb.log_artifact(last_model_artifact)
+                try:
+                    if wandb.run and hasattr(wandb.run, 'dir') and wandb.run.dir:
+                        dest_last = os.path.join(wandb.run.dir, os.path.basename(last_save_path))
+                        shutil.copy2(last_save_path, dest_last)
+                except Exception as e:
+                    print(f"[WandB] Warning copy last to run.dir: {e}")
+                print(f"[WandB]  ✓ Đã upload latest-model: {last_save_path}")
         
         wandb.finish()
 

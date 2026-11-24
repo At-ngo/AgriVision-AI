@@ -1,0 +1,34 @@
+# ===================================================================
+# Experiment: RGB Specialist (ResNet-34 Two-Stage Layer4 Fine-Tuning)
+# Dedicated RGB Backbone for Hybrid Ensemble v7
+# ===================================================================
+
+INPUT_MODE: "rgb"
+DEVICE: "auto"
+MODEL_NAME: "resnet34_rgb"
+RGB_PRETRAINED: true
+DROPOUT_P: 0.3
+LABEL_SMOOTHING: 0.05
+
+BATCH_SIZE: 16
+EPOCHS: 100
+EARLY_STOPPING_PATIENCE: 10
+
+# Two-Stage Selective Unfreezing (Only layer4 + FC -> Anti-Overfit)
+UNFREEZE_EPOCH: 3
+UNFREEZE_TARGET: "layer4"
+
+# Differential Learning Rate
+LR: 0.0003
+BACKBONE_LR: 0.00005
+HEAD_LR: 0.0003
+
+OPTIMIZER: "AdamW"
+WEIGHT_DECAY: 0.01
+
+SCHEDULER: "Cosine"
+T_MAX: 100
+ETA_MIN: 0.000005
+
+SAVE_BEST_METRIC: "val_f1"
+SPLIT_MANIFEST_PATH: "splits/seed42_val20/split_manifest.csv"

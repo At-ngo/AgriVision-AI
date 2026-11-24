@@ -1,0 +1,38 @@
+# ===================================================================
+# Experiment: Spectral-Spatial Compact Fusion Network (SS-CFNet v5)
+# Multimodal: Hyperspectral (125ch) + Multispectral (5ch) + RGB (3ch)
+# Architecture: Pixel-SNV + Spectral Derivative + Physical VIs + Residual Multimodal Gate
+# ===================================================================
+
+INPUT_MODE: "multimodal"
+MODEL_NAME: "resnet18"
+RGB_PRETRAINED: true
+
+# SS-CFNet Architecture parameters
+FUSION_TYPE: "ss_cfnet"
+DROPOUT_P: 0.3
+LABEL_SMOOTHING: 0.05
+
+# Training hyperparameters
+BATCH_SIZE: 16           # Tối ưu tốc độ CPU
+EPOCHS: 100              # 100 epochs max theo yêu cầu chuyên nghiệp
+EARLY_STOPPING_PATIENCE: 10 # Dừng sớm sau 10 epoch không cải thiện
+
+# Two-tier Differential Learning Rate
+LR: 0.0003               # Tốc độ học chuẩn
+HEAD_LR: 0.0003          # Spectral branches và heads học từ đầu
+BACKBONE_LR: 0.00005     # Pretrained RGB backbone tinh chỉnh êm, bảo vệ đặc trưng ImageNet
+OPTIMIZER: "AdamW"
+WEIGHT_DECAY: 0.001
+
+# Scheduler
+SCHEDULER: "Cosine"
+T_MAX: 100
+ETA_MIN: 0.00001
+
+# Joint Training (Huấn luyện đồng bộ với differential LR)
+UNFREEZE_EPOCH: 0
+
+# Evaluation & Checkpoint
+SAVE_BEST_METRIC: "val_f1"     # Lưu checkpoint theo Macro F1 cao nhất
+SPLIT_MANIFEST_PATH: "splits/seed42_val20/split_manifest.csv"

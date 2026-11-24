@@ -73,6 +73,7 @@ class Trainer:
         self.history_rows = []
         self.best_val_acc = 0.0
         self.best_val_loss = float("inf")
+        self.best_val_f1 = 0.0
         self.best_epoch = 0
         self.best_train_loss = float("inf")
         self.history_csv_path = (
@@ -212,6 +213,23 @@ class Trainer:
         if self.output_dir:
             os.makedirs(self.output_dir, exist_ok=True)
 
+        # ── Setup WandB custom metrics & plots ─────────────────────────────
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.define_metric("epoch")
+                wandb.define_metric("loss/train", step_metric="epoch")
+                wandb.define_metric("loss/val", step_metric="epoch")
+                wandb.define_metric("accuracy/train", step_metric="epoch")
+                wandb.define_metric("accuracy/val", step_metric="epoch")
+                wandb.define_metric("metrics/*", step_metric="epoch")
+                wandb.define_metric("class_f1/*", step_metric="epoch")
+                wandb.define_metric("class_recall/*", step_metric="epoch")
+                wandb.define_metric("learning_rate", step_metric="epoch")
+                wandb.define_metric("epoch_time_sec", step_metric="epoch")
+        except Exception:
+            pass
+
         # ── Training banner ────────────────────────────────────────────────
         mode_tag = "Multimodal Late Fusion (HS + MS + RGB)" if self.is_multimodal else "RGB-only (ResNet)"
         _header(f"TRAINING START  ·  {mode_tag}")
@@ -283,8 +301,18 @@ class Trainer:
             self.history["val_acc"].append(val_acc)
 
             # ── Best model ────────────────────────────────────────────────
+            val_f1 = 0.0
+            if y_true is not None and y_pred is not None:
+                from sklearn.metrics import f1_score
+                val_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+
             if val_acc is not None and val_loss is not None:
-                if self.save_best_metric == "val_loss":
+                if self.save_best_metric in {"val_f1", "f1", "macro_f1"}:
+                    f1_is_better = val_f1 > self.best_val_f1
+                    f1_is_tied = np.isclose(val_f1, self.best_val_f1)
+                    loss_breaks_tie = val_loss < self.best_val_loss
+                    is_best = f1_is_better or (f1_is_tied and loss_breaks_tie)
+                elif self.save_best_metric == "val_loss":
                     is_best = val_loss < self.best_val_loss
                 else: # val_acc default
                     acc_is_better = val_acc > self.best_val_acc
@@ -295,6 +323,7 @@ class Trainer:
                 if is_best:
                     self.best_val_acc = val_acc
                     self.best_val_loss = val_loss
+                    self.best_val_f1 = val_f1
                     self.best_epoch = epoch
                     self.epochs_without_improvement = 0
                 else:
@@ -330,8 +359,11 @@ class Trainer:
                 and y_true is not None
                 and y_pred is not None
                 and self.class_names
-                and self.log_confusion_every
-                and (epoch % self.log_confusion_every == 0 or epoch == self.epochs or is_best)
+                and (
+                    is_best
+                    or epoch == self.epochs
+                    or (self.log_confusion_every > 0 and epoch % self.log_confusion_every == 0)
+                )
             )
             confusion_paths = {}
             if should_log_confusion and self.output_dir:
@@ -348,16 +380,44 @@ class Trainer:
                 import wandb
                 if wandb.run is not None:
                     log_payload = {
-                        "epoch"      : epoch,
-                        "train/loss" : train_loss,
-                        "train/acc"  : train_acc,
-                        "lr"         : lr_after,
+                        "epoch"            : epoch,
+                        "loss/train"       : train_loss,
+                        "accuracy/train"   : train_acc,
+                        "learning_rate"    : lr_after,
+                        "epoch_time_sec"   : epoch_time,
+                        # Giữ backward-compatible keys
+                        "train/loss"       : train_loss,
+                        "train/acc"        : train_acc,
+                        "lr"               : lr_after,
                     }
                     if val_loss is not None and val_acc is not None:
                         log_payload.update({
-                            "val/loss": val_loss,
-                            "val/acc": val_acc,
+                            "loss/val"    : val_loss,
+                            "accuracy/val": val_acc,
+                            "val/loss"    : val_loss,
+                            "val/acc"     : val_acc,
                         })
+
+                    if y_true is not None and y_pred is not None:
+                        from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
+                        val_f1_mac = f1_score(y_true, y_pred, average="macro", zero_division=0)
+                        val_prec_mac = precision_score(y_true, y_pred, average="macro", zero_division=0)
+                        val_rec_mac = recall_score(y_true, y_pred, average="macro", zero_division=0)
+                        log_payload.update({
+                            "metrics/val_f1_macro"       : val_f1_mac,
+                            "metrics/val_precision_macro": val_prec_mac,
+                            "metrics/val_recall_macro"   : val_rec_mac,
+                        })
+
+                        if self.class_names:
+                            rep = classification_report(
+                                y_true, y_pred, target_names=self.class_names, output_dict=True, zero_division=0
+                            )
+                            for c_name in self.class_names:
+                                if c_name in rep:
+                                    log_payload[f"class_f1/{c_name}"] = rep[c_name]["f1-score"]
+                                    log_payload[f"class_recall/{c_name}"] = rep[c_name]["recall"]
+
                     if should_log_confusion:
                         log_payload["val/confusion_matrix"] = wandb.plot.confusion_matrix(
                             probs=None,
@@ -365,6 +425,16 @@ class Trainer:
                             preds=y_pred,
                             class_names=self.class_names,
                         )
+                        if confusion_paths.get("png") and os.path.exists(confusion_paths["png"]):
+                            log_payload["val/confusion_matrix_image"] = wandb.Image(
+                                confusion_paths["png"],
+                                caption=f"Epoch {epoch} Confusion Matrix"
+                            )
+                            log_payload["confusion_matrix_heatmap"] = wandb.Image(
+                                confusion_paths["png"],
+                                caption=f"Epoch {epoch} Confusion Matrix Heatmap"
+                            )
+
                     wandb.log(log_payload)
             except ImportError:
                 pass
@@ -377,6 +447,7 @@ class Trainer:
                 'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
                 'best_val_acc'        : self.best_val_acc,
                 'best_val_loss'       : self.best_val_loss,
+                'best_val_f1'         : self.best_val_f1,
                 'best_epoch'          : self.best_epoch,
                 'best_train_loss'     : self.best_train_loss,
                 'history'             : self.history,
@@ -389,6 +460,7 @@ class Trainer:
 
             if is_best:
                 torch.save(checkpoint_state, self.save_path)
+                print(f"  ★ [Epoch {epoch:02d}] Đạt F1/Acc kỷ lục mới! Đã lưu checkpoint tại: {self.save_path}")
 
             # ── Epoch summary ─────────────────────────────────────────────
             best_mark = "*" if is_best else ""
@@ -419,6 +491,7 @@ class Trainer:
         _header("TRAINING COMPLETE")
         print(f"  Total time   : {total_train_time/60:.1f} min")
         if self.val_loader is not None:
+            print(f"  Best val_f1  : {self.best_val_f1:.4f}")
             print(f"  Best val_acc : {self.best_val_acc:.4f}")
             print(f"  Best val_loss: {self.best_val_loss:.4f}")
             print(f"  Best epoch   : {self.best_epoch}")
@@ -428,5 +501,16 @@ class Trainer:
         print(f"  Best model   : {self.save_path}")
         print(f"  Last model   : {self.save_path.replace('.pth', '_last.pth')}")
         _sep()
+
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.run.summary["best_epoch"] = self.best_epoch
+                wandb.run.summary["best_val_f1"] = self.best_val_f1
+                wandb.run.summary["best_val_acc"] = self.best_val_acc
+                wandb.run.summary["best_val_loss"] = self.best_val_loss
+                wandb.run.summary["total_train_time_min"] = total_train_time / 60.0
+        except Exception:
+            pass
 
         return self.history

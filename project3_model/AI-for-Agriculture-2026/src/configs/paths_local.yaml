@@ -1,0 +1,22 @@
+# Paths for Local Environment (Windows / CPU / GPU)
+DATA_DIR: 'Data'
+CHECKPOINT_DIR: 'checkpoints'
+OUTPUT_DIR: 'outputs'
+ROOT_DIR: '.'
+
+# Data directories
+TRAIN_DIR: 'Data/train'
+VAL_DIR: 'Data/val'
+
+TRAIN_RGB_DIR: 'Data/train/RGB'
+TRAIN_HS_DIR: 'Data/train/HS'
+TRAIN_MS_DIR: 'Data/train/MS'
+
+# Submission set (Data/val/ không có nhãn)
+VAL_RGB_DIR: 'Data/val/RGB'
+VAL_HS_DIR: 'Data/val/HS'
+VAL_MS_DIR: 'Data/val/MS'
+
+TEST_RGB_DIR: 'Data/val/RGB'
+TEST_HS_DIR: 'Data/val/HS'
+TEST_MS_DIR: 'Data/val/MS'

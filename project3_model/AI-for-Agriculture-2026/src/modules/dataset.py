@@ -28,14 +28,17 @@ def _array_to_chw(data, expected_channels, path):
     if arr.ndim == 2:
         arr = arr[np.newaxis, :, :]
     elif arr.ndim == 3:
-        if arr.shape[0] == expected_channels:
-            pass
-        elif arr.shape[-1] == expected_channels:
+        if arr.shape[-1] >= expected_channels:
+            arr = arr[:, :, :expected_channels].transpose(2, 0, 1)
+        elif arr.shape[0] >= expected_channels:
+            arr = arr[:expected_channels, :, :]
+        elif arr.shape[-1] < arr.shape[0]:
             arr = arr.transpose(2, 0, 1)
+            pad_c = expected_channels - arr.shape[0]
+            arr = np.pad(arr, ((0, pad_c), (0, 0), (0, 0)), mode="constant")
         else:
-            raise ValueError(
-                f"Expected {expected_channels} channels for {path}, got shape {arr.shape}"
-            )
+            pad_c = expected_channels - arr.shape[0]
+            arr = np.pad(arr, ((0, pad_c), (0, 0), (0, 0)), mode="constant")
     else:
         raise ValueError(f"Unsupported spectral shape for {path}: {arr.shape}")
 
@@ -48,14 +51,22 @@ def _array_to_chw(data, expected_channels, path):
 
 def _read_tiff_chw(path, expected_channels):
     """Read single-frame or multi-frame spectral TIFF as (C, H, W)."""
-    with Image.open(path) as img:
-        n_frames = getattr(img, "n_frames", 1)
-        if n_frames > 1:
-            frames = [_frame_to_chw(np.asarray(frame)) for frame in ImageSequence.Iterator(img)]
-            data = np.concatenate(frames, axis=0)
-        else:
-            data = np.asarray(img)
-    return _array_to_chw(data, expected_channels, path)
+    try:
+        import tifffile
+        data = tifffile.imread(path)
+        return _array_to_chw(data, expected_channels, path)
+    except Exception as e:
+        try:
+            with Image.open(path) as img:
+                n_frames = getattr(img, "n_frames", 1)
+                if n_frames > 1:
+                    frames = [_frame_to_chw(np.asarray(frame)) for frame in ImageSequence.Iterator(img)]
+                    data = np.concatenate(frames, axis=0)
+                else:
+                    data = np.asarray(img)
+            return _array_to_chw(data, expected_channels, path)
+        except Exception:
+            raise e
 
 
 def _load_spectral_tensor(data_dir, base_name, expected_channels, default_hw):
@@ -78,6 +89,15 @@ def _load_spectral_tensor(data_dir, base_name, expected_channels, default_hw):
         data = _array_to_chw(data, expected_channels, path)
     else:
         data = _read_tiff_chw(path, expected_channels)
+
+    # Spectral Min-Max Normalization về [0, 1] tránh giá trị uint16 áp đảo RGB
+    data = data.astype(np.float32)
+    d_min = float(np.min(data))
+    d_max = float(np.max(data))
+    if d_max > d_min:
+        data = (data - d_min) / (d_max - d_min)
+    elif d_max > 1.0:
+        data = data / 65535.0
 
     return torch.tensor(data, dtype=torch.float32)
 

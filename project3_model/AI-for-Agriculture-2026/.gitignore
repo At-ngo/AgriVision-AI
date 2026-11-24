@@ -1,32 +1,44 @@
+# Data & Datasets (NEVER push raw data)
+Data/
+data/
 dataset/
 data_split/
-checkpoints/
 
+# Model Checkpoints (NEVER push heavy weights)
+checkpoints/
+*.pt
+*.pth
+*.pt1
+*.ckpt
+*.joblib
+
+# WandB & Logs
 wandb/
 **/wandb/
-
-# Logs
 *.log
 
-# Jupyter
+# Jupyter & Python cache
 .ipynb_checkpoints/
-
 *__pycache__*
+*.pyc
 
-*.pt
-
-*.pth
-
-*.pt1
+# Misc & Office lock files
 misc/
-
 eda/
+tools/
+~$*.docx
+~$*.xlsx
+
+# Raw image/spectral & temporary CSV artifacts
 *.png
 *.tif
 *.tiff
-<<<<<<< HEAD
-data_split/
-=======
 *.csv
-tools/
->>>>>>> 7df1b2e52d431d0b5e9248b3c6a31a7595b768e6
+
+# Explicitly keep key v6 research summary CSVs & publication charts
+!TONG_HOP_THUC_NGHIEM.csv
+!TONG_HOP_CHECKPOINT.csv
+!submission_hybrid_v6.csv
+!outputs/hybrid_v6_val_confusion_matrix.png
+!outputs/research_benchmark_v6.png
+!outputs/overfit_analysis_v5_vs_v6.png
